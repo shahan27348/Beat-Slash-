@@ -11,7 +11,14 @@ import * as THREE from 'three';
 export const TRACK_LENGTH = 50;
 export const SPAWN_Z = -30;
 export const PLAYER_Z = 0;
-export const MISS_Z = 5;
+export const MISS_Z = 3;
+
+// Hit detection
+export const HIT_RADIUS = 0.75;          // how close the saber tip has to pass to a note
+export const HIT_WINDOW_FRONT = 2.2;     // notes become hittable this far (in world units) before the player
+export const HIT_WINDOW_BACK = 1.4;      // ...and stay hittable this far behind the player
+export const SWING_SPEED_PERFECT = 3.2;  // world units / second
+export const SWING_SPEED_GREAT = 1.6;
 
 export const LANE_WIDTH = 0.8;
 export const LAYER_HEIGHT = 0.8;
@@ -26,13 +33,18 @@ const BEAT_TIME = 60 / SONG_BPM;
 
 // Difficulty configs
 export const DIFFICULTY_CONFIG: Record<Difficulty, { noteSpeed: number; beatStep: number; maxBeats: number; healthDrain: number; healthGain: number }> = {
-  easy:   { noteSpeed: 9,  beatStep: 4, maxBeats: 120, healthDrain: 10, healthGain: 4 },
-  normal: { noteSpeed: 12, beatStep: 2, maxBeats: 180, healthDrain: 15, healthGain: 2 },
-  hard:   { noteSpeed: 16, beatStep: 1, maxBeats: 220, healthDrain: 20, healthGain: 1 },
+  easy:   { noteSpeed: 9,  beatStep: 4, maxBeats: 120, healthDrain: 7,  healthGain: 4 },
+  normal: { noteSpeed: 12, beatStep: 2, maxBeats: 180, healthDrain: 10, healthGain: 3 },
+  hard:   { noteSpeed: 16, beatStep: 1, maxBeats: 220, healthDrain: 14, healthGain: 2 },
 };
 
-export let NOTE_SPEED = 12;
-export const setNoteSpeed = (speed: number) => { NOTE_SPEED = speed; };
+export const BASE_POINTS: Record<'perfect' | 'great' | 'good', number> = {
+  perfect: 150,
+  great: 110,
+  good: 70,
+};
+
+export const getMultiplier = (combo: number) => (combo >= 30 ? 8 : combo >= 20 ? 4 : combo >= 10 ? 2 : 1);
 
 export const generateChart = (difficulty: Difficulty): NoteData[] => {
   const cfg = DIFFICULTY_CONFIG[difficulty];
@@ -91,8 +103,6 @@ export const generateChart = (difficulty: Difficulty): NoteData[] => {
 
   return notes.sort((a, b) => a.time - b.time);
 };
-
-export const DEMO_CHART = generateChart('normal');
 
 // Vectors for direction checking
 export const DIRECTION_VECTORS: Record<CutDirection, THREE.Vector3> = {

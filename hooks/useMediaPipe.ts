@@ -4,243 +4,289 @@
 */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { HandLandmarker, FilesetResolver, HandLandmarkerResult } from '@mediapipe/tasks-vision';
+import { HandLandmarker, FilesetResolver, HandLandmarkerResult, NormalizedLandmark } from '@mediapipe/tasks-vision';
 import * as THREE from 'three';
+import { HandPositions } from '../types';
 
-// Mapping 2D normalized coordinates to 3D game world.
-const mapHandToWorld = (x: number, y: number): THREE.Vector3 => {
-  const GAME_X_RANGE = 5; 
-  const GAME_Y_RANGE = 3.5;
-  const Y_OFFSET = 0.8;
+// Keep the wasm runtime in lock-step with the installed npm package, a mismatch breaks initialisation.
+const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm';
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
-  // MediaPipe often returns mirrored X if facingMode is 'user'.
-  // We might need to invert X depending on the final behavior.
-  // For now, assuming standard mirroring where 0 is left-screen (user's right hand physically if mirrored).
-  const worldX = (0.5 - x) * GAME_X_RANGE; 
+// How long a hand is kept alive after tracking drops out, avoids sabers flickering on a single bad frame.
+const LOST_GRACE_MS = 160;
+
+// Mapping 2D normalized coordinates (raw, un-mirrored camera image) to the 3D game world.
+const GAME_X_RANGE = 5;
+const GAME_Y_RANGE = 3.5;
+const Y_OFFSET = 0.8;
+
+const mapHandToWorld = (x: number, y: number, out: THREE.Vector3): THREE.Vector3 => {
+  // The camera image is not mirrored, so the user's right hand appears on the left of the frame.
+  const worldX = (0.5 - x) * GAME_X_RANGE;
   const worldY = (1.0 - y) * GAME_Y_RANGE - (GAME_Y_RANGE / 2) + Y_OFFSET;
-
   const worldZ = -Math.max(0, worldY * 0.2);
-
-  return new THREE.Vector3(worldX, Math.max(0.1, worldY), worldZ);
+  return out.set(worldX, Math.max(0.1, worldY), worldZ);
 };
+
+/**
+ * One Euro filter: heavy smoothing when the hand is still (no jitter),
+ * light smoothing when it moves fast (no lag on swings).
+ */
+class OneEuroFilter {
+  private x: number | null = null;
+  private dx = 0;
+  constructor(private minCutoff: number, private beta: number, private dCutoff = 1.0) {}
+
+  private static alpha(cutoff: number, dt: number) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+
+  reset() { this.x = null; this.dx = 0; }
+
+  filter(value: number, dt: number): number {
+    if (this.x === null || dt <= 0) {
+      this.x = value;
+      return value;
+    }
+    const rawDx = (value - this.x) / dt;
+    const aD = OneEuroFilter.alpha(this.dCutoff, dt);
+    this.dx = this.dx + aD * (rawDx - this.dx);
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
+    const a = OneEuroFilter.alpha(cutoff, dt);
+    this.x = this.x + a * (value - this.x);
+    return this.x;
+  }
+}
+
+class HandTracker {
+  private fx = new OneEuroFilter(1.6, 1.2);
+  private fy = new OneEuroFilter(1.6, 1.2);
+  private fz = new OneEuroFilter(1.6, 1.2);
+  private cx = new OneEuroFilter(1.2, 3.0);
+  private cy = new OneEuroFilter(1.2, 3.0);
+  private raw = new THREE.Vector3();
+  private lastPos: THREE.Vector3 | null = null;
+  private lastSeen = 0;
+
+  position: THREE.Vector3 | null = null;
+  velocity = new THREE.Vector3();
+  cursor: { x: number; y: number } | null = null;
+  pinching = false;
+
+  update(landmarks: NormalizedLandmark[] | null, now: number, dt: number) {
+    if (!landmarks) {
+      if (this.position && now - this.lastSeen > LOST_GRACE_MS) this.lose();
+      else this.velocity.multiplyScalar(0.6);
+      return;
+    }
+    this.lastSeen = now;
+
+    const tip = landmarks[8];
+    mapHandToWorld(tip.x, tip.y, this.raw);
+
+    const pos = this.position ?? new THREE.Vector3();
+    pos.set(
+      this.fx.filter(this.raw.x, dt),
+      this.fy.filter(this.raw.y, dt),
+      this.fz.filter(this.raw.z, dt),
+    );
+
+    if (this.lastPos && dt > 0.001) {
+      // Exponentially smoothed velocity so a single noisy frame does not spike it.
+      const vx = (pos.x - this.lastPos.x) / dt;
+      const vy = (pos.y - this.lastPos.y) / dt;
+      const vz = (pos.z - this.lastPos.z) / dt;
+      this.velocity.x += (vx - this.velocity.x) * 0.55;
+      this.velocity.y += (vy - this.velocity.y) * 0.55;
+      this.velocity.z += (vz - this.velocity.z) * 0.55;
+    }
+    this.lastPos = (this.lastPos ?? new THREE.Vector3()).copy(pos);
+    this.position = pos;
+
+    // Pinch detection relative to hand size, with hysteresis so it doesn't flicker.
+    const thumb = landmarks[4];
+    const index = landmarks[8];
+    const handSize = Math.hypot(landmarks[0].x - landmarks[9].x, landmarks[0].y - landmarks[9].y) || 0.1;
+    const pinchRatio = Math.hypot(thumb.x - index.x, thumb.y - index.y) / handSize;
+    if (this.pinching) this.pinching = pinchRatio < 0.42;
+    else this.pinching = pinchRatio < 0.25;
+
+    // Cursor follows the pinch point (between thumb and index), mirrored to match what the user sees.
+    // Slightly expanded so the screen edges are reachable without stretching.
+    const px = 1 - (thumb.x + index.x) / 2;
+    const py = (thumb.y + index.y) / 2;
+    const ex = THREE.MathUtils.clamp((px - 0.5) * 1.35 + 0.5, 0, 1);
+    const ey = THREE.MathUtils.clamp((py - 0.5) * 1.35 + 0.5, 0, 1);
+    this.cursor = { x: this.cx.filter(ex, dt), y: this.cy.filter(ey, dt) };
+  }
+
+  private lose() {
+    this.position = null;
+    this.lastPos = null;
+    this.cursor = null;
+    this.pinching = false;
+    this.velocity.set(0, 0, 0);
+    this.fx.reset(); this.fy.reset(); this.fz.reset();
+    this.cx.reset(); this.cy.reset();
+  }
+}
 
 export const useMediaPipe = (videoRef: React.RefObject<HTMLVideoElement | null>) => {
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handPositionsRef = useRef<{
-    left: THREE.Vector3 | null;
-    right: THREE.Vector3 | null;
-    lastLeft: THREE.Vector3 | null;
-    lastRight: THREE.Vector3 | null;
-    leftVelocity: THREE.Vector3;
-    rightVelocity: THREE.Vector3;
-    leftPinching: boolean;
-    rightPinching: boolean;
-    leftCursorPos: { x: number; y: number } | null;
-    rightCursorPos: { x: number; y: number } | null;
-    lastTimestamp: number;
-  }>({
+  const handPositionsRef = useRef<HandPositions>({
     left: null,
     right: null,
-    lastLeft: null,
-    lastRight: null,
-    leftVelocity: new THREE.Vector3(0,0,0),
-    rightVelocity: new THREE.Vector3(0,0,0),
+    leftVelocity: new THREE.Vector3(),
+    rightVelocity: new THREE.Vector3(),
     leftPinching: false,
     rightPinching: false,
     leftCursorPos: null,
     rightCursorPos: null,
-    lastTimestamp: 0
   });
 
   // To expose raw results for UI preview
   const lastResultsRef = useRef<HandLandmarkerResult | null>(null);
 
-  const landmarkerRef = useRef<HandLandmarker | null>(null);
-  const requestRef = useRef<number>(0);
-
   useEffect(() => {
     let isActive = true;
+    let landmarker: HandLandmarker | null = null;
+    let rafId = 0;
+    let stream: MediaStream | null = null;
+    let lastVideoTime = -1;
+    let lastProcess = performance.now();
+
+    const trackers = { left: new HandTracker(), right: new HandTracker() };
 
     const setupMediaPipe = async () => {
       try {
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm"
-        );
-        
+        const vision = await FilesetResolver.forVisionTasks(WASM_URL);
         if (!isActive) return;
 
-        const landmarker = await HandLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
-            delegate: "GPU"
-          },
-          runningMode: "VIDEO",
+        const options = (delegate: 'GPU' | 'CPU') => ({
+          baseOptions: { modelAssetPath: MODEL_URL, delegate },
+          runningMode: 'VIDEO' as const,
           numHands: 2,
           minHandDetectionConfidence: 0.5,
           minHandPresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5
+          minTrackingConfidence: 0.5,
         });
 
-        if (!isActive) {
-             landmarker.close();
-             return;
+        try {
+          landmarker = await HandLandmarker.createFromOptions(vision, options('GPU'));
+        } catch (gpuErr) {
+          console.warn('GPU delegate unavailable, falling back to CPU', gpuErr);
+          landmarker = await HandLandmarker.createFromOptions(vision, options('CPU'));
         }
 
-        landmarkerRef.current = landmarker;
-        startCamera();
+        if (!isActive) {
+          landmarker.close();
+          return;
+        }
+        await startCamera();
       } catch (err: any) {
-        console.error("Error initializing MediaPipe:", err);
-        setError(`Failed to load hand tracking: ${err.message}`);
+        console.error('Error initializing MediaPipe:', err);
+        if (isActive) setError(`Failed to load hand tracking: ${err?.message ?? err}`);
       }
     };
 
     const startCamera = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'user',
-            width: { ideal: 640 },
-            height: { ideal: 480 }
-          }
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 60 } },
         });
-
-        if (videoRef.current && isActive) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.onloadeddata = () => {
-             if (isActive) {
-                 setIsCameraReady(true);
-                 predictWebcam();
-             }
-          };
+        if (!isActive) {
+          stream.getTracks().forEach(t => t.stop());
+          return;
         }
-      } catch (err) {
-        console.error("Camera Error:", err);
-        setError("Could not access camera.");
+        const video = videoRef.current;
+        if (!video) return;
+        video.srcObject = stream;
+        video.onloadeddata = () => {
+          if (!isActive) return;
+          video.play().catch(() => { /* muted autoplay, safe to ignore */ });
+          setIsCameraReady(true);
+          predictWebcam();
+        };
+      } catch (err: any) {
+        console.error('Camera Error:', err);
+        if (!isActive) return;
+        setError(err?.name === 'NotAllowedError'
+          ? 'Camera permission denied. Allow camera access and reload the page.'
+          : 'Could not access camera. Make sure no other app is using it.');
       }
     };
 
     const predictWebcam = () => {
-        if (!videoRef.current || !landmarkerRef.current || !isActive) return;
+      if (!isActive) return;
+      const video = videoRef.current;
 
-        const video = videoRef.current;
-        // Only process if video has data
-        if (video.videoWidth > 0 && video.videoHeight > 0) {
-             let startTimeMs = performance.now();
-             try {
-                 const results = landmarkerRef.current.detectForVideo(video, startTimeMs);
-                 lastResultsRef.current = results;
-                 processResults(results);
-             } catch (e) {
-                 // Sometimes detectForVideo fails if timestamps aren't strictly increasing or video is not ready
-                 console.warn("Detection failed this frame", e);
-             }
+      // Only run detection when the camera produced a new frame. Running it on the same frame twice
+      // used to produce a zero velocity followed by a doubled one, which made hit grading random.
+      if (video && landmarker && video.videoWidth > 0 && video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const now = performance.now();
+        try {
+          const results = landmarker.detectForVideo(video, now);
+          lastResultsRef.current = results;
+          processResults(results, now);
+        } catch (e) {
+          console.warn('Detection failed this frame', e);
         }
+      }
 
-        requestRef.current = requestAnimationFrame(predictWebcam);
+      rafId = requestAnimationFrame(predictWebcam);
     };
 
-    const processResults = (results: HandLandmarkerResult) => {
-        const now = performance.now();
-        const deltaTime = (now - handPositionsRef.current.lastTimestamp) / 1000;
-        handPositionsRef.current.lastTimestamp = now;
+    const processResults = (results: HandLandmarkerResult, now: number) => {
+      const dt = Math.min(0.1, (now - lastProcess) / 1000);
+      lastProcess = now;
 
-        let newLeft: THREE.Vector3 | null = null;
-        let newRight: THREE.Vector3 | null = null;
-        let leftPinch = false;
-        let rightPinch = false;
-        let leftCursor: { x: number; y: number } | null = null;
-        let rightCursor: { x: number; y: number } | null = null;
+      let leftLm: NormalizedLandmark[] | null = null;
+      let rightLm: NormalizedLandmark[] | null = null;
 
-        if (results.landmarks) {
-          for (let i = 0; i < results.landmarks.length; i++) {
-            const landmarks = results.landmarks[i];
-            // Note: MediaPipe 'handedness' can be counter-intuitive when mirrored.
-            const classification = results.handedness[i][0];
-            const isRight = classification.categoryName === 'Right'; 
-            
-            // Index finger tip is landmark 8
-            const tip = landmarks[8];
-            const worldPos = mapHandToWorld(tip.x, tip.y);
-            
-            // Detect pinch gesture: distance between thumb tip (4) and index tip (8)
-            const thumbTip = landmarks[4];
-            const indexTip = landmarks[8];
-            const pinchDistance = Math.sqrt(
-              Math.pow(thumbTip.x - indexTip.x, 2) + 
-              Math.pow(thumbTip.y - indexTip.y, 2)
-            );
-            const isPinching = pinchDistance < 0.05; // Threshold for pinch
-            
-            // Cursor position (screen coordinates)
-            const cursorPos = { x: indexTip.x, y: indexTip.y };
+      const hands = (results.landmarks ?? []).map((lm, i) => ({
+        lm,
+        label: results.handedness?.[i]?.[0]?.categoryName,
+      }));
 
-            if (isRight) {
-                 newRight = worldPos;
-                 rightPinch = isPinching;
-                 rightCursor = cursorPos;
-            } else {
-                 newLeft = worldPos;
-                 leftPinch = isPinching;
-                 leftCursor = cursorPos;
-            }
-          }
+      if (hands.length === 2 && hands[0].label === hands[1].label) {
+        // Both hands got the same label: fall back to screen position.
+        // Raw image x is un-mirrored, so the larger x is the user's left hand.
+        const [a, b] = hands;
+        const aIsLeft = a.lm[0].x > b.lm[0].x;
+        leftLm = aIsLeft ? a.lm : b.lm;
+        rightLm = aIsLeft ? b.lm : a.lm;
+      } else {
+        for (const h of hands) {
+          if (h.label === 'Right') rightLm = h.lm;
+          else leftLm = h.lm;
         }
+      }
 
-        // --- Update State with Smoothing & Velocity ---
-        const s = handPositionsRef.current;
-        const LERP = 0.7; // Increased for more responsive tracking 
-        
-        // Update pinch states
-        s.leftPinching = leftPinch;
-        s.rightPinching = rightPinch;
-        s.leftCursorPos = leftCursor;
-        s.rightCursorPos = rightCursor;
+      trackers.left.update(leftLm, now, dt);
+      trackers.right.update(rightLm, now, dt);
 
-        // Left
-        if (newLeft) {
-            if (s.left) {
-                newLeft.lerpVectors(s.left, newLeft, LERP);
-                if (deltaTime > 0.001) { 
-                     s.leftVelocity.subVectors(newLeft, s.left).divideScalar(deltaTime);
-                }
-            }
-            s.lastLeft = s.left ? s.left.clone() : newLeft.clone();
-            s.left = newLeft;
-        } else {
-            s.left = null;
-        }
-
-        // Right
-        if (newRight) {
-             if (s.right) {
-                 newRight.lerpVectors(s.right, newRight, LERP);
-                 if (deltaTime > 0.001) {
-                      s.rightVelocity.subVectors(newRight, s.right).divideScalar(deltaTime);
-                 }
-             }
-             s.lastRight = s.right ? s.right.clone() : newRight.clone();
-             s.right = newRight;
-        } else {
-            s.right = null;
-        }
+      const s = handPositionsRef.current;
+      s.left = trackers.left.position;
+      s.right = trackers.right.position;
+      s.leftVelocity.copy(trackers.left.velocity);
+      s.rightVelocity.copy(trackers.right.velocity);
+      s.leftPinching = trackers.left.pinching;
+      s.rightPinching = trackers.right.pinching;
+      s.leftCursorPos = trackers.left.cursor;
+      s.rightCursorPos = trackers.right.cursor;
     };
 
     setupMediaPipe();
 
     return () => {
       isActive = false;
-      if (requestRef.current) {
-          cancelAnimationFrame(requestRef.current);
-      }
-      if (landmarkerRef.current) {
-          landmarkerRef.current.close();
-      }
-      if (videoRef.current && videoRef.current.srcObject) {
-          const stream = videoRef.current.srcObject as MediaStream;
-          stream.getTracks().forEach(t => t.stop());
-      }
+      cancelAnimationFrame(rafId);
+      landmarker?.close();
+      stream?.getTracks().forEach(t => t.stop());
     };
   }, [videoRef]);
 

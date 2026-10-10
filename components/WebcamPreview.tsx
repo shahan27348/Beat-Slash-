@@ -112,12 +112,11 @@ const WebcamPreview: React.FC<WebcamPreviewProps> = ({ videoRef, resultsRef, isC
     if (!isCameraReady) return null;
 
     return (
-        <div className="fixed bottom-4 right-4 w-64 h-48 bg-black/60 border-2 border-blue-500/30 rounded-xl overflow-hidden backdrop-blur-md z-50 shadow-[0_0_20px_rgba(0,0,0,0.5)] pointer-events-none transition-opacity duration-500 hidden md:block">
-             {/* Header/Label */}
-            <div className="absolute top-0 left-0 right-0 bg-black/40 text-[10px] text-blue-300/70 px-2 py-1 font-mono uppercase tracking-widest">
-                Tracking Feed
+        <div className="fixed bottom-4 right-4 w-56 aspect-[4/3] bg-black/60 border border-white/10 rounded-xl overflow-hidden z-30 shadow-[0_0_30px_rgba(0,0,0,0.6)] pointer-events-none hidden md:block">
+            <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-cover" />
+            <div className="absolute top-0 left-0 right-0 bg-gradient-to-b from-black/70 to-transparent text-[9px] text-white/60 px-2 py-1.5 font-mono uppercase tracking-[0.2em] flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" /> Tracking
             </div>
-            <canvas ref={canvasRef} className="w-full h-full object-cover mt-4" />
         </div>
     );
 };
