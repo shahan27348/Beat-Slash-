@@ -120,16 +120,16 @@ const Note: React.FC<NoteProps> = ({ data, noteSpeed, timeRef }) => {
       }
 
       if (flashRef.current) {
-        const f = Math.min(1, dt / 0.18);
+        const f = Math.min(1, dt / 0.12);
         flashRef.current.visible = f < 1;
-        flashRef.current.scale.setScalar(0.6 + f * 2.2);
-        materials.flash.opacity = (1 - f) * 0.9;
+        flashRef.current.scale.setScalar(0.4 + f * 0.6);
+        materials.flash.opacity = (1 - f) * 0.35;
       }
       if (ringRef.current) {
         const f = Math.min(1, dt / 0.35);
         ringRef.current.visible = f < 1;
-        ringRef.current.scale.setScalar(1 + f * 3.5);
-        materials.ring.opacity = 1 - f;
+        ringRef.current.scale.setScalar(0.8 + f * 1.3);
+        materials.ring.opacity = (1 - f) * 0.6;
       }
       return;
     }

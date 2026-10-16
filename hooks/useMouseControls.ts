@@ -56,7 +56,8 @@ export const useMouseControls = (handPositionsRef: React.MutableRefObject<HandPo
 
         if (side === 'left') { s.left = pos; s.right = null; s.rightVelocity.set(0, 0, 0); }
         else { s.right = pos; s.left = null; s.leftVelocity.set(0, 0, 0); }
-      } else {
+      } else if (hasPrev) {
+        // Clear once when the pointer leaves, then leave the hands alone.
         s.left = null; s.right = null;
         hasPrev = false;
       }

@@ -164,7 +164,7 @@ const AmbientParticles: React.FC = () => {
   const data = useMemo(() => Array.from({ length: count }, () => ({
     x: (Math.random() - 0.5) * 14,
     y: Math.random() * 6,
-    z: (Math.random() - 0.5) * 40 - 10,
+    z: 1 - Math.random() * 40, // stay in front of the camera, close ones looked like grey blobs
     speed: 0.2 + Math.random() * 0.5,
     offset: Math.random() * Math.PI * 2,
   })), []);

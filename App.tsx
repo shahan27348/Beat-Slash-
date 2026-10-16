@@ -132,6 +132,8 @@ const App: React.FC = () => {
 
   const { isCameraReady, handPositionsRef, lastResultsRef, error: cameraError } = useMediaPipe(videoRef);
   useMouseControls(handPositionsRef, mouseMode);
+  // Dev-only handle used by the promo capture script to drive the sabers.
+  if ((import.meta as any).env?.DEV) (window as any).__saberHands = handPositionsRef;
   // Real hand tracking wins once the camera comes up.
   useEffect(() => { if (isCameraReady) setMouseMode(false); }, [isCameraReady]);
   const inputReady = isCameraReady || mouseMode;
@@ -545,8 +547,8 @@ const App: React.FC = () => {
             <div className="panel p-8 md:p-10 text-center w-full max-w-xl animate-[slideUp_0.4s_ease-out]">
               <div className="text-[10px] tracking-[0.5em] text-white/40 mb-2">MOTION RHYTHM</div>
               <h1 className="text-6xl md:text-7xl font-black text-white mb-8 tracking-tight italic leading-none">
-                <span style={{ color: COLORS.left, textShadow: `0 0 30px ${COLORS.left}` }}>BEAT</span>{' '}
-                <span style={{ color: COLORS.right, textShadow: `0 0 30px ${COLORS.right}` }}>SLASH</span>
+                <span style={{ color: COLORS.left, textShadow: `0 0 30px ${COLORS.left}` }}>SABER</span>{' '}
+                <span style={{ color: COLORS.right, textShadow: `0 0 30px ${COLORS.right}` }}>BLAST</span>
               </h1>
 
               <div className="grid grid-cols-3 gap-3 mb-8">
